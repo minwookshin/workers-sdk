@@ -1,6 +1,8 @@
-import { describe, test } from "vitest";
+import { convertV4MiniflareOptions, Miniflare, Response } from "miniflare";
+import { describe, test, vi } from "vitest";
 import { serialiseError } from "../../../api/startDevWorker/events";
 import { ProxyController } from "../../../api/startDevWorker/ProxyController";
+import { createDeferred } from "../../../api/startDevWorker/utils";
 import { FakeBus } from "../../helpers/fake-bus";
 import { mockConsoleMethods } from "../../helpers/mock-console";
 import type { SerializedError } from "../../../api/startDevWorker/events";
@@ -62,4 +64,98 @@ describe("ProxyController", () => {
 		expect(event.stack).toContain("Error: boom");
 		expect(event.exceptionDetails?.exceptionId).toBe(1);
 	});
+});
+
+describe("ProxyController teardown", () => {
+	mockConsoleMethods();
+
+	test("finishes an in-flight message before disposing and skips queued messages", async ({
+		expect,
+	}) => {
+		const controller = new ProxyController(new FakeBus());
+		const worker = new Miniflare(
+			convertV4MiniflareOptions({
+				workers: [
+					{
+						modules: true,
+						script:
+							"export default {fetch() {return new Response(null, {status: 204})}}",
+					},
+				],
+			})
+		);
+		controller.proxyWorker = worker;
+		controller.emitReadyEvent(worker, await worker.ready, undefined);
+		const started = createDeferred<void>();
+		const finished = createDeferred<Response>();
+		const dispatch = vi
+			.spyOn(worker, "dispatchFetch")
+			.mockImplementation(() => {
+				started.resolve();
+				return finished.promise;
+			});
+		const dispose = vi.spyOn(worker, "dispose");
+		const first = controller.sendMessageToProxyWorker({ type: "pause" });
+		await started.promise;
+		const queued = controller.sendMessageToProxyWorker({ type: "pause" });
+		const teardown = controller.teardown();
+		try {
+			await Promise.resolve();
+			expect(dispose).not.toHaveBeenCalled();
+		} finally {
+			finished.resolve(new Response(null, { status: 204 }));
+			await Promise.all([first, queued, teardown]);
+		}
+		expect(dispatch).toHaveBeenCalledTimes(1);
+		expect(dispose).toHaveBeenCalledTimes(1);
+		await controller.sendMessageToProxyWorker({ type: "pause" });
+		expect(dispatch).toHaveBeenCalledTimes(1);
+	});
+
+	test("does not wait for initial readiness when tearing down", async ({
+		expect,
+	}) => {
+		const controller = new ProxyController(new FakeBus());
+		const message = controller.sendMessageToProxyWorker({ type: "pause" });
+		await controller.teardown();
+		await expect(message).resolves.toBeUndefined();
+	}, 5000);
+
+	test("does not wait for a pending reload when tearing down", async ({
+		expect,
+	}) => {
+		const controller = new ProxyController(new FakeBus());
+		const worker = new Miniflare(
+			convertV4MiniflareOptions({
+				workers: [
+					{
+						modules: true,
+						script:
+							"export default {fetch() {return new Response(null, {status: 204})}}",
+					},
+				],
+			})
+		);
+		const url = await worker.ready;
+		controller.proxyWorker = worker;
+		controller.emitReadyEvent(worker, url, undefined);
+		const pendingReload = createDeferred<URL>();
+		const waiting = createDeferred<void>();
+		const ready = vi.spyOn(worker, "ready", "get").mockImplementation(() => {
+			waiting.resolve();
+			return pendingReload.promise;
+		});
+		const dispatch = vi.spyOn(worker, "dispatchFetch");
+		try {
+			const message = controller.sendMessageToProxyWorker({ type: "pause" });
+			await waiting.promise;
+			await controller.teardown();
+			await expect(message).resolves.toBeUndefined();
+			expect(dispatch).not.toHaveBeenCalled();
+		} finally {
+			ready.mockRestore();
+			pendingReload.resolve(url);
+			await worker.dispose();
+		}
+	}, 5000);
 });

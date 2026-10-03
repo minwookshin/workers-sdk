@@ -328,6 +328,7 @@ export class ProxyController extends Controller {
 	}
 
 	runtimeMessageMutex = new Mutex();
+	private teardownRequested = createDeferred<void>();
 	async sendMessageToProxyWorker(
 		message: ProxyWorkerIncomingRequestBody,
 		retries = 3
@@ -340,10 +341,24 @@ export class ProxyController extends Controller {
 
 		try {
 			await this.runtimeMessageMutex.runWith(async () => {
-				const { proxyWorker } = await this.ready.promise;
-
-				const ready = await proxyWorker.ready.catch(() => undefined);
-				if (!ready) {
+				if (this._torndown) {
+					return;
+				}
+				const teardownRequested = (this.teardownRequested =
+					createDeferred<void>());
+				const event = await Promise.race([
+					this.ready.promise,
+					teardownRequested.promise,
+				]);
+				if (!event || this._torndown) {
+					return;
+				}
+				const { proxyWorker } = event;
+				const ready = await Promise.race([
+					proxyWorker.ready.catch(() => undefined),
+					teardownRequested.promise,
+				]);
+				if (!ready || this._torndown) {
 					return;
 				}
 
@@ -599,10 +614,14 @@ export class ProxyController extends Controller {
 
 	_torndown = false;
 	override async teardown() {
+		this._torndown = true;
+		this.teardownRequested.resolve();
 		await super.teardown();
 		logger.debug("ProxyController teardown beginning...");
-		this._torndown = true;
 
+		// Let active control requests finish before disposing their HTTP dispatcher.
+		// Queued requests and readiness waits are released by the teardown signal.
+		await this.runtimeMessageMutex.drained();
 		const { proxyWorker } = this;
 		this.proxyWorker = undefined;
 
